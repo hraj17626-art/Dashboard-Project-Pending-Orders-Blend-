@@ -851,11 +851,23 @@ function computeDedupedConversion(useFilters, respectDateRange){
   }
   const candidates = flat.filter(r=>r.OrderType==='SO' && r.ForcastOrderNo);
   const firstSeen = {}, rep = {};
+  // Key by VNo + Product (not VNo alone): one SO voucher can carry several
+  // product lines, each with its own RaisedQty — keying on VNo alone would
+  // keep only one line and silently drop the rest of that voucher's quantity.
   candidates.forEach(r=>{
-    if(!firstSeen[r.VNo] || r.ReportDate<firstSeen[r.VNo]) firstSeen[r.VNo]=r.ReportDate;
-    if(!rep[r.VNo] || r.ReportDate>rep[r.VNo].ReportDate) rep[r.VNo]=r;
+    const key = rowKey(r);
+    if(!firstSeen[key] || r.ReportDate<firstSeen[key]) firstSeen[key]=r.ReportDate;
+    if(!rep[key] || r.ReportDate>rep[key].ReportDate) rep[key]=r;
   });
-  const records = Object.keys(rep).map(vno=>({...rep[vno], FirstSeen: firstSeen[vno]}));
+  // The conversion date is the SO's own Date column (the day that SO was actually
+  // raised) — a real, accurate transaction date — not just the day we happened to
+  // first capture it in an uploaded snapshot. Falls back to first-seen only if the
+  // row has no Date value at all.
+  const records = Object.keys(rep).map(key=>{
+    const r = rep[key];
+    const convertedOn = r.Date || firstSeen[key];
+    return {...r, FirstSeen: firstSeen[key], ConvertedOn: convertedOn};
+  });
   const totalQty = sum(records,'RaisedQty');
   const byExecutive = {};
   records.forEach(r=>{ byExecutive[r.Executive]=(byExecutive[r.Executive]||0)+(r.RaisedQty||0); });
@@ -886,12 +898,18 @@ function conversionPctTrend(execFilter){
   let flat = allRowsFlat();
   const candidates = flat.filter(r=>r.OrderType==='SO' && r.ForcastOrderNo && (!execFilter || execFilter==='__all__' || r.Executive===execFilter));
   const firstSeen={}, rep={};
+  // Same VNo+Product keying as computeDedupedConversion — see the comment there.
   candidates.forEach(r=>{
-    if(!firstSeen[r.VNo] || r.ReportDate<firstSeen[r.VNo]) firstSeen[r.VNo]=r.ReportDate;
-    if(!rep[r.VNo] || r.ReportDate>rep[r.VNo].ReportDate) rep[r.VNo]=r;
+    const key = rowKey(r);
+    if(!firstSeen[key] || r.ReportDate<firstSeen[key]) firstSeen[key]=r.ReportDate;
+    if(!rep[key] || r.ReportDate>rep[key].ReportDate) rep[key]=r;
   });
+  // Bucket each converted line by its own Date column (the real conversion date),
+  // falling back to first-seen only when Date is blank.
+  const convertedOn = {};
+  Object.keys(rep).forEach(key=>{ convertedOn[key] = rep[key].Date || firstSeen[key]; });
   return dates.map(d=>{
-    const upTo = Object.keys(rep).filter(vno=>firstSeen[vno]<=d).map(vno=>rep[vno]);
+    const upTo = Object.keys(rep).filter(key=>convertedOn[key]<=d).map(key=>rep[key]);
     const convertedQty = sum(upTo,'RaisedQty');
     const dayRows = (SNAPSHOTS[d]||[]).filter(r=>r.OrderType==='FSO' && (!execFilter || execFilter==='__all__' || r.Executive===execFilter));
     const fsoPending = sum(dayRows,'FinalPendingQty');
@@ -918,7 +936,7 @@ function renderConversion(){
         <div class="chart-box"><canvas id="cExecChart"></canvas></div>
       </div>
       <div class="panel">
-        <div class="panel-head"><div class="panel-title">Daily conversion activity</div><div class="panel-note">By date first seen · MT</div></div>
+        <div class="panel-head"><div class="panel-title">Daily conversion activity</div><div class="panel-note">By conversion date (SO's Date column) · MT</div></div>
         <div class="chart-box"><canvas id="cTrendChart"></canvas></div>
       </div>
     </div>
@@ -983,16 +1001,19 @@ function renderConversion(){
       scales:{x:{ticks:{...CHART_DEFAULTS, callback:v=>v.toFixed(1)+' MT'}, grid:{color:'#eef0f2'}}, y:{ticks:CHART_DEFAULTS, grid:{display:false}}}}
   });
 
-  // trend by first-seen date, top 6 executives + Others
+  // trend by actual conversion date (the SO's own Date column), top 6 executives + Others
   const execTotalsAll = Object.entries(conv.byExecutive).sort((a,b)=>b[1]-a[1]);
   const topExecs = execTotalsAll.slice(0,6).map(e=>e[0]);
   const byDateExec = {};
   conv.records.forEach(r=>{
     const key = topExecs.includes(r.Executive) ? r.Executive : 'Others';
     byDateExec[key] = byDateExec[key] || {};
-    byDateExec[key][r.FirstSeen] = (byDateExec[key][r.FirstSeen]||0) + (r.RaisedQty||0);
+    byDateExec[key][r.ConvertedOn] = (byDateExec[key][r.ConvertedOn]||0) + (r.RaisedQty||0);
   });
-  const trendDates = dates;
+  // Use the actual conversion dates seen in the data as the timeline — these are real
+  // transaction dates and won't always line up with the dates you happened to upload a
+  // snapshot for, so we can't just reuse the snapshot date list here.
+  const trendDates = Array.from(new Set(conv.records.map(r=>r.ConvertedOn).filter(Boolean))).sort();
   const trendSeries = Object.keys(byDateExec).map((exec,i)=>({
     label: exec,
     data: trendDates.map(d => (byDateExec[exec][d]||0)/MT),
@@ -1050,7 +1071,7 @@ function renderConversion(){
     {key:'CustomerName', label:'Customer', fmt:r=>`<span class="mono-name" title="${escapeHtml(r.CustomerName)}">${escapeHtml(r.CustomerName)}</span>`},
     {key:'Executive', label:'Executive'},
     {key:'RaisedQty', label:'Converted qty', align:'num', fmt:r=>fmtKg(r.RaisedQty), defaultDesc:true},
-    {key:'FirstSeen', label:'First seen', fmt:r=>shortDate(r.FirstSeen)},
+    {key:'ConvertedOn', label:'Converted on', fmt:r=>shortDate(r.ConvertedOn)},
     {key:'ReportDate', label:'Latest seen', fmt:r=>shortDate(r.ReportDate)},
   ];
   renderTable({container:document.getElementById('cTable'), tableId:'convTable', columns:cols, rows:conv.records, searchEl:document.getElementById('cSearch'), emptyMsg:'No FSO-linked SO orders in the selected range'});
